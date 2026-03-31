@@ -1,0 +1,97 @@
+.plugin-content {
+  width: 100%;
+  padding: 12px 16px; /* Added slightly more side padding since container has none */
+  border-radius: 0;
+  color: var(--color-text-offwhite);
+  margin: 0;
+  border: none;
+  border-top: 1px solid var(--color-border-light);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1 1 auto; /* Fill available space */
+  box-sizing: border-box;
+  background-color: transparent;
+}
+
+/* Explicitly hide scrollbar for this container */
+.plugin-content::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  background: transparent;
+}
+
+.welcome-message {
+  color: var(--color-text-offwhite);
+  padding: 6px;
+  opacity: 0.8;
+}
+
+
+.bubble {
+  max-width: 78%;
+  padding: 10px 14px;
+  border-radius: 14px;
+  display: inline-block;
+  flex: 0 0 auto; /* prevent shrinking */
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-bottom: 6px;
+  font-size: var(--chat-font-size, 13px);
+  line-height: 1.4;
+}
+
+.bubble.bot {
+  background: var(--color-bubble-bot-bg);
+  color: var(--color-bubble-bot-text);
+  align-self: flex-start;
+  border-top-left-radius: 6px;
+  border: 1px solid var(--color-border-light);
+}
+
+.bubble.user {
+  background: var(--color-accent-blue);
+  color: white;
+  align-self: flex-end;
+  border-top-right-radius: 6px;
+}
+
+.bubble-text { white-space: pre-wrap; }
+
+/* Loading dots animation */
+.loading-container {
+  display: inline-flex;
+  align-items: baseline;
+}
+
+.loading-dots-text {
+  display: inline-block;
+  margin-left: 2px;
+  min-width: 20px; /* Prevent layout shift */
+}
+
+/* Typing animation */
+.typing-in-progress {
+  display: inline-block;
+}
+
+.typing-cursor {
+  display: inline-block;
+  margin-left: 2px;
+  animation: blink-cursor 1s infinite;
+  color: var(--color-bubble-bot-text, currentColor);
+}
+
+.typing-complete {
+  display: inline-block;
+}
+
+@keyframes blink-cursor {
+  0%, 50% {
+    opacity: 1;
+  }
+  51%, 100% {
+    opacity: 0;
+  }
+}

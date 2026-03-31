@@ -1,0 +1,71 @@
+const path = require("path");
+const CleanWebpackPlugin = require("clean-webpack-plugin");
+const CopyPlugin = require("copy-webpack-plugin");
+
+module.exports = {
+  entry: "./src/index.jsx",
+  output: {
+    path: path.resolve(__dirname, "dist"),
+    filename: "index.js",
+  },
+  devtool: "cheap-eval-source-map", // won't work on XD due to lack of eval
+  externals: {
+    uxp: "commonjs2 uxp",
+    premierepro: "commonjs2 premierepro",
+  },
+  resolve: {
+    extensions: [".js", ".jsx"],
+  },
+  module: {
+    rules: [
+      {
+        test: /\.jsx?$/,
+        exclude: /node_modules/,
+        loader: "babel-loader",
+        options: {
+          plugins: [
+            "@babel/transform-react-jsx",
+            "@babel/proposal-object-rest-spread",
+            "@babel/plugin-syntax-class-properties",
+          ],
+        },
+      },
+      {
+        test: /\.png$/,
+        exclude: /node_modules/,
+        loader: "file-loader",
+      },
+      {
+        test: /\.css$/,
+        use: [
+          "style-loader",
+          "css-loader",
+        ],
+      },
+    ],
+  },
+  plugins: [
+    //new CleanWebpackPlugin(),
+    new CopyPlugin(["plugin"], {
+      copyUnmodified: true,
+    }),
+    // Copy built files back to plugin folder after build
+    {
+      apply: (compiler) => {
+        compiler.hooks.afterEmit.tap('CopyToPlugin', () => {
+          const fs = require('fs');
+          const path = require('path');
+          const distPath = path.resolve(__dirname, 'dist');
+          const pluginPath = path.resolve(__dirname, 'plugin');
+          ['index.js', 'index.html', 'manifest.json'].forEach(file => {
+            const src = path.join(distPath, file);
+            const dest = path.join(pluginPath, file);
+            if (fs.existsSync(src)) {
+              fs.copyFileSync(src, dest);
+            }
+          });
+        });
+      }
+    },
+  ],
+};

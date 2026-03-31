@@ -1,0 +1,1278 @@
+const ppro = require("premierepro");
+import { 
+  getClipDuration, 
+  getClipInPoint, 
+  getMotionScaleParam,
+  validateClip,
+  logClipInfo 
+} from './clipUtils.js';
+
+// ============ UTILITY ============
+function log(msg, color = "white") {
+  console.log(`[Edit][${color}] ${msg}`);
+}
+
+async function executeAction(project, action) {
+  return new Promise((resolve, reject) => {
+    try {
+      project.lockedAccess(() => {
+        project.executeTransaction((compound) => {
+          compound.addAction(action);
+        });
+        resolve();
+      });
+    } catch (err) {
+      log(`Error executing action: ${err}`, "red");
+      reject(err);
+    }
+  });
+}
+
+// ============ KEYFRAME HELPERS ============
+
+/**
+ * Create a keyframe at a specific time with interpolation
+ * @param {ComponentParam} param - The parameter to add keyframe to
+ * @param {Project} project - Premiere Pro project
+ * @param {number} seconds - Time in seconds
+ * @param {number} value - Keyframe value
+ * @param {string} interpolation - 'LINEAR', 'BEZIER', 'HOLD', 'EASE_IN', 'EASE_OUT'
+ * @returns {Promise<boolean>}
+ */
+async function addKeyframe(param, project, seconds, value, interpolation = 'BEZIER') {
+  try {
+    log(`Creating keyframe at ${seconds.toFixed(2)}s with value ${value}`, "blue");
+
+    // Enable time-varying if not already enabled
+    await project.lockedAccess(async () => {
+      project.executeTransaction((compound) => {
+        const action = param.createSetTimeVaryingAction(true);
+        compound.addAction(action);
+      });
+    });
+    log(`✓ Time-varying enabled`, "green");
+
+    // Add the keyframe
+    await project.lockedAccess(async () => {
+      project.executeTransaction((compound) => {
+        const keyframe = param.createKeyframe(value);
+        keyframe.position = ppro.TickTime.createWithSeconds(seconds);
+        const action = param.createAddKeyframeAction(keyframe);
+        compound.addAction(action);
+      });
+    });
+    log(`✓ Keyframe added at ${seconds.toFixed(2)}s`, "green");
+
+    // Set interpolation mode
+    const modeMap = {
+      'LINEAR': ppro.Constants.InterpolationMode.LINEAR,
+      'BEZIER': ppro.Constants.InterpolationMode.BEZIER,
+      'HOLD': ppro.Constants.InterpolationMode.HOLD,
+      'EASE_IN': ppro.Constants.InterpolationMode.EASE_IN,
+      'EASE_OUT': ppro.Constants.InterpolationMode.EASE_OUT,
+    };
+    const interpMode = modeMap[interpolation] || ppro.Constants.InterpolationMode.BEZIER;
+
+    await project.lockedAccess(async () => {
+      project.executeTransaction((compound) => {
+        const action = param.createSetInterpolationAtKeyframeAction(
+          ppro.TickTime.createWithSeconds(seconds),
+          interpMode
+        );
+        compound.addAction(action);
+      });
+    });
+    log(`✓ Interpolation set to ${interpolation}`, "green");
+
+    log(`✅ Keyframe successfully created at ${seconds.toFixed(2)}s: value=${value}`, "green");
+    return true;
+  } catch (err) {
+    log(`❌ Error adding keyframe: ${err.message || err}`, "red");
+    console.error("Keyframe creation error details:", err);
+    return false;
+  }
+}
+
+// ============ ZOOM FUNCTIONS ============
+
+/**
+ * Zoom in on a clip - creates animation from start scale to end scale (or static zoom)
+ * @param {TrackItem} trackItem - The clip to zoom
+ * @param {Object} options - Zoom options
+ * @param {number} options.startScale - Starting scale percentage (default: 100)
+ * @param {number} options.endScale - Ending scale percentage (default: 150)
+ * @param {number} options.startTime - Start time in seconds relative to clip (default: 0)
+ * @param {number} options.duration - Duration of zoom in seconds (default: entire clip)
+ * @param {string} options.interpolation - 'LINEAR', 'BEZIER', 'HOLD', 'EASE_IN', 'EASE_OUT' (default: 'BEZIER')
+ * @param {boolean} options.animated - If true, creates gradual zoom (100%→150%). If false, creates static zoom (150%→150%) (default: true)
+ * @returns {Promise<boolean>}
+ */
+export async function zoomIn(trackItem, options = {}) {
+  let {
+    startScale,
+    endScale = 150,
+    startTime = 0,
+    duration = null,
+    interpolation = 'BEZIER',
+    animated = false  // Default to static zoom (unless user explicitly asks for gradual)
+  } = options;
+  
+  const actualEndScale = endScale;
+
+  try {
+    log(`Starting zoomIn function...`, "blue");
+    
+    // Validate clip
+    const validation = await validateClip(trackItem);
+    if (!validation.valid) {
+      log(`❌ Cannot zoom: ${validation.reason}`, "red");
+      return false;
+    }
+    log(`✓ Clip validation passed`, "green");
+
+    // Get project
+    const project = await ppro.Project.getActiveProject();
+    if (!project) {
+      log("❌ No active project", "red");
+      return false;
+    }
+    log(`✓ Project found`, "green");
+
+    // Get Motion Scale parameter
+    log(`Looking for Motion Scale parameter...`, "blue");
+    const context = await getMotionScaleParam(trackItem, project);
+    if (!context) {
+      log("❌ Could not get Motion Scale parameter", "red");
+      return false;
+    }
+    log(`✓ Motion Scale parameter found`, "green");
+
+    const { componentParam } = context;
+
+    // Calculate timing
+    const clipDuration = await getClipDuration(trackItem);
+    const clipStartTime = await getClipInPoint(trackItem);
+    
+    if (clipDuration === null || clipStartTime === null) {
+      log(`❌ Could not get clip timing information`, "red");
+      return false;
+    }
+    
+    const zoomDuration = duration || clipDuration;
+    const absoluteStartTime = clipStartTime + startTime;
+    const absoluteEndTime = absoluteStartTime + zoomDuration;
+
+    // Resolve startScale if not provided
+    if (startScale === undefined) {
+      if (startTime > 0) {
+        // If starting mid-clip, try to get the current value at that time
+        // This enables smooth chaining (e.g. zoom in then out)
+        try {
+          const val = await componentParam.getValueAtTime(
+            ppro.TickTime.createWithSeconds(absoluteStartTime)
+          );
+          const currentVal = (val && typeof val.getValue === 'function') 
+            ? await val.getValue() 
+            : Number(val);
+            
+          startScale = currentVal;
+          log(`Dynamically determined startScale at ${startTime}s: ${startScale}`, "blue");
+        } catch (e) {
+          log(`Could not get current scale, defaulting to 100: ${e}`, "yellow");
+          startScale = 100;
+        }
+      } else {
+        // Default to 100 if starting at beginning
+        startScale = 100;
+      }
+    }
+
+    // For static zoom, use the endScale for both start and end
+    const actualStartScale = animated ? startScale : endScale;
+
+    // Log different messages for animated vs static zoom
+    if (animated) {
+      log(`Applying gradual zoom: ${actualStartScale}% → ${actualEndScale}% over ${zoomDuration.toFixed(2)}s`, "blue");
+    } else {
+      log(`Applying static zoom: ${actualEndScale}% throughout entire clip`, "blue");
+    }
+    log(`Clip starts at: ${clipStartTime.toFixed(2)}s, duration: ${clipDuration.toFixed(2)}s`, "blue");
+    log(`Keyframes at: ${absoluteStartTime.toFixed(2)}s and ${absoluteEndTime.toFixed(2)}s`, "blue");
+    await logClipInfo(trackItem);
+
+    // Create start keyframe
+    log(`Creating start keyframe at ${absoluteStartTime.toFixed(2)}s with value ${actualStartScale}`, "blue");
+    const startSuccess = await addKeyframe(
+      componentParam, 
+      project, 
+      absoluteStartTime, 
+      actualStartScale, 
+      interpolation
+    );
+
+    if (!startSuccess) {
+      log("❌ Failed to create start keyframe", "red");
+      return false;
+    }
+
+    // Create end keyframe
+    log(`Creating end keyframe at ${absoluteEndTime.toFixed(2)}s with value ${actualEndScale}`, "blue");
+    const endSuccess = await addKeyframe(
+      componentParam, 
+      project, 
+      absoluteEndTime, 
+      actualEndScale, 
+      interpolation
+    );
+
+    if (!endSuccess) {
+      log("❌ Failed to create end keyframe", "red");
+      return false;
+    }
+
+    if (animated) {
+      log(`✅ Gradual zoom applied successfully! Scale ${actualStartScale}% → ${actualEndScale}%`, "green");
+    } else {
+      log(`✅ Static zoom applied successfully! Scale ${actualEndScale}% throughout clip`, "green");
+    }
+    return true;
+  } catch (err) {
+    log(`❌ Error in zoomIn: ${err.message || err}`, "red");
+    console.error("zoomIn error details:", err);
+    return false;
+  }
+}
+
+/**
+ * Zoom out on a clip - creates animation from larger scale to smaller scale
+ * @param {TrackItem} trackItem - The clip to zoom
+ * @param {Object} options - Zoom options (same as zoomIn)
+ * @returns {Promise<boolean>}
+ */
+export async function zoomOut(trackItem, options = {}) {
+  const {
+    endScale = 100,
+    startScale,
+    ...otherOptions
+  } = options;
+
+  // If startScale is not provided and it's a simple start-of-clip zoom out, default to 150.
+  // Otherwise (mid-clip or chained), leave undefined to let zoomIn resolve it dynamically.
+  let effectiveStartScale = startScale;
+  if (effectiveStartScale === undefined && (!options.startTime || options.startTime === 0)) {
+    effectiveStartScale = 150;
+  }
+
+  log("Applying zoom out...", "blue");
+  return await zoomIn(trackItem, { startScale: effectiveStartScale, endScale, ...otherOptions });
+}
+
+/**
+ * Apply zoom in to multiple clips
+ * @param {TrackItem[]} trackItems - Array of clips
+ * @param {Object} options - Zoom options
+ * @returns {Promise<{successful: number, failed: number}>}
+ */
+export async function zoomInBatch(trackItems, options = {}) {
+  log(`Applying zoom in to ${trackItems.length} clip(s)...`, "blue");
+  
+  let successful = 0;
+  let failed = 0;
+
+  for (let i = 0; i < trackItems.length; i++) {
+    const clip = trackItems[i];
+    log(`Processing clip ${i + 1}/${trackItems.length}...`, "blue");
+    
+    const result = await zoomIn(clip, options);
+    if (result) {
+      successful++;
+    } else {
+      failed++;
+    }
+  }
+
+  log(`✅ Batch complete: ${successful} successful, ${failed} failed`, "green");
+  return { successful, failed };
+}
+
+/**
+ * Apply zoom out to multiple clips
+ * @param {TrackItem[]} trackItems - Array of clips
+ * @param {Object} options - Zoom options
+ * @returns {Promise<{successful: number, failed: number}>}
+ */
+export async function zoomOutBatch(trackItems, options = {}) {
+  log(`Applying zoom out to ${trackItems.length} clip(s)...`, "blue");
+  
+  let successful = 0;
+  let failed = 0;
+
+  for (let i = 0; i < trackItems.length; i++) {
+    const clip = trackItems[i];
+    log(`Processing clip ${i + 1}/${trackItems.length}...`, "blue");
+    
+    const result = await zoomOut(clip, options);
+    if (result) {
+      successful++;
+    } else {
+      failed++;
+    }
+  }
+
+  log(`✅ Batch complete: ${successful} successful, ${failed} failed`, "green");
+  return { successful, failed };
+}
+
+// ============ BLUR ============
+/**
+ * Apply blur effect to a single track item
+ * @param {TrackItem} trackItem - The clip to apply blur to
+ * @param {number} blurriness - Blur amount (default: 50)
+ * @returns {Promise<boolean>}
+ */
+export async function applyBlur(trackItem, blurriness = 50) {
+  try {
+    const project = await ppro.Project.getActiveProject();
+    if (!project) {
+      log("No active project", "red");
+      return false;
+    }
+
+    if (!trackItem) {
+      log("No track item provided", "red");
+      return false;
+    }
+
+    const componentChain = await trackItem.getComponentChain();
+    if (!componentChain) {
+      log("No component chain", "red");
+      return false;
+    }
+
+    // Helper to find a param named "Blurriness" across all components
+    const findBlurrinessParam = async () => {
+      const compCount = componentChain.getComponentCount();
+      for (let ci = 0; ci < compCount; ci++) {
+        const comp = componentChain.getComponentAtIndex(ci);
+        const paramCount = comp.getParamCount();
+        for (let pi = 0; pi < paramCount; pi++) {
+          const param = await comp.getParam(pi);
+          const name = ((param && param.displayName) || "").trim().toLowerCase();
+          if (name === "blurriness") {
+            return param;
+          }
+        }
+      }
+      return null;
+    };
+
+    // Try to find existing "Blurriness"
+    let blurParam = await findBlurrinessParam();
+
+    // If not found, append Gaussian Blur and try again
+    if (!blurParam) {
+      const blurComponent = await ppro.VideoFilterFactory.createComponent("AE.ADBE Gaussian Blur 2");
+      const appendAction = await componentChain.createAppendComponentAction(blurComponent);
+      await executeAction(project, appendAction);
+      blurParam = await findBlurrinessParam();
+    }
+
+    if (!blurParam) {
+      log("Could not find Blurriness parameter", "yellow");
+      return false;
+    }
+
+    // Set value via keyframe (required by createSetValueAction)
+    const keyframe = blurParam.createKeyframe(Number(blurriness));
+    const setAction = blurParam.createSetValueAction(keyframe, true);
+    await executeAction(project, setAction);
+
+    log(`✅ Blur effect (${blurriness}) applied`, "green");
+    return true;
+
+  } catch (err) {
+    log(`Error applying blur: ${err}`, "red");
+    return false;
+  }
+}
+
+// ============ TRANSITIONS ============
+export async function applyTransition(item, transitionName, durationSeconds = 1.0, applyToStart = true, transitionAllignment = 0.5) {
+  try {
+    const matchNameList = await ppro.TransitionFactory.getVideoTransitionMatchNames();
+    console.log("Available transitions:", matchNameList);
+    const matched = matchNameList.find(n => n.toLowerCase() === transitionName.toLowerCase());
+
+    if (!matched) {
+      log(`Transition not found: ${transitionName}`, "red");
+      return false;
+    }
+
+    const videoTransition = await ppro.TransitionFactory.createVideoTransition(matched);
+    const opts = new ppro.AddTransitionOptions();
+    console.log("AddTransitionOptions created:", opts);
+    opts.setApplyToStart(applyToStart);
+    const time = await ppro.TickTime.createWithSeconds(durationSeconds);
+    opts.setDuration(time);
+    opts.setForceSingleSided(false);
+    opts.setTransitionAlignment(transitionAllignment);
+
+    const project = await ppro.Project.getActiveProject();
+    const action = await item.createAddVideoTransitionAction(videoTransition, opts);
+    await executeAction(project, action);
+
+    log(`Transition applied: ${matched}`, "green");
+    return true;
+  } catch (err) {
+    log(`Error applying transition: ${err}`, "red");
+    return false;
+  }
+}
+
+// ============ FILTERS/EFFECTS ============
+export async function applyRandomFilter(item) {
+  try {
+    const matchNames = await ppro.VideoFilterFactory.getMatchNames();
+    console.log("Available video filters:", matchNames);
+    if (!matchNames || matchNames.length === 0) {
+      log("No video filters available", "red");
+      return false;
+    }
+
+    const randomName = matchNames[Math.floor(Math.random() * matchNames.length)];
+    const component = await ppro.VideoFilterFactory.createComponent(randomName);
+    const componentChain = await item.getComponentChain();
+    const project = await ppro.Project.getActiveProject();
+    const action = await componentChain.createAppendComponentAction(component);
+    await executeAction(project, action);
+
+    log(`Filter applied: ${randomName}`, "green");
+    return true;
+  } catch (err) {
+    log(`Error applying filter: ${err}`, "red");
+    return false;
+  }
+}
+
+export async function applyFilter(item, filterName) {
+  try {
+    const matchNames = await ppro.VideoFilterFactory.getMatchNames();
+    console.log("Available video filters:", matchNames);
+    if (!matchNames.includes(filterName)) {
+      log(`Filter not found: ${filterName}`, "red");
+      return false;
+    }
+    const component = await ppro.VideoFilterFactory.createComponent(filterName);
+    const componentChain = await item.getComponentChain();
+    const project = await ppro.Project.getActiveProject();
+    const action = await componentChain.createAppendComponentAction(component);
+    await executeAction(project, action);
+    const compCount = componentChain.getComponentCount();
+    console.log("Component count after adding filter:", compCount);
+    for (let ci = 0; ci < compCount; ci++) {
+      const comp = await componentChain.getComponentAtIndex(ci);
+      const name = await comp.getMatchName();
+      const dispName = await comp.getDisplayName();
+      console.log(`Component ${ci}: ${name} (${dispName})`);
+      const paramCount = comp.getParamCount();
+      for (let pi = 0; pi < paramCount; pi++) {
+        const param = await comp.getParam(pi);
+        console.log(" Param details:", param);
+        const name = (param && param.displayName ? param.displayName : "").trim().toLowerCase();
+        console.log("  Param:", name);
+      }
+    }
+
+    log(`Filter applied: ${filterName}`, "green");
+    return true;
+  } catch (err) {
+    log(`Error applying filter: ${err}`, "red");
+    return false;
+  }
+}
+
+// ============ AUDIO EFFECTS ============
+
+/**
+ * Apply an audio filter/effect to an audio clip
+ * @param {AudioClipTrackItem} audioClip - The audio clip to apply effect to
+ * @param {string} filterDisplayName - Display name of the audio filter (e.g., "Parametric EQ", "Reverb")
+ * @returns {Promise<boolean>}
+ */
+export async function applyAudioFilter(audioClip, filterDisplayName) {
+  try {
+    log(`Applying audio filter: ${filterDisplayName}`, "blue");
+    
+    const project = await ppro.Project.getActiveProject();
+    if (!project) {
+      log("No active project", "red");
+      return false;
+    }
+
+    if (!audioClip) {
+      log("No audio clip provided", "red");
+      return false;
+    }
+
+    // Get available audio filter display names
+    const displayNames = await ppro.AudioFilterFactory.getDisplayNames();
+    console.log("Available audio filters:", displayNames);
+    
+    // Normalize the search term (lowercase, remove common words)
+    const normalizedSearch = filterDisplayName.toLowerCase().trim();
+    
+    // Common name mappings (user-friendly names -> actual filter names)
+    const nameMappings = {
+      'reverb': ['Studio Reverb', 'Convolution Reverb', 'Surround Reverb', 'AUReverb2', 'AUMatrixReverb'],
+      'eq': ['Parametric Equalizer', 'Simple Parametric EQ', 'Graphic Equalizer (10 Bands)', 'Graphic Equalizer (20 Bands)', 'Graphic Equalizer (30 Bands)'],
+      'equalizer': ['Parametric Equalizer', 'Simple Parametric EQ', 'Graphic Equalizer (10 Bands)', 'Graphic Equalizer (20 Bands)', 'Graphic Equalizer (30 Bands)'],
+      'parametric eq': ['Parametric Equalizer', 'Simple Parametric EQ'],
+      'noise reduction': ['Adaptive Noise Reduction', 'DeNoise'],
+      'denoise': ['Adaptive Noise Reduction', 'DeNoise'],
+      'deesser': ['DeEsser'],
+      'chorus': ['Chorus/Flanger'],
+      'flanger': ['Chorus/Flanger', 'Flanger'],
+      'delay': ['Delay', 'Multitap Delay', 'Analog Delay'],
+      'distortion': ['Distortion'],
+      'compressor': ['Multiband Compressor', 'Single-band Compressor', 'Tube-modeled Compressor'],
+      'limiter': ['Hard Limiter'],
+      'phaser': ['Phaser'],
+      'pitch': ['Pitch Shifter', 'AUPitch', 'AUNewPitch'],
+    };
+    
+    let matchingName = null;
+    
+    // First, try exact match (case-insensitive)
+    matchingName = displayNames.find(name => 
+      name.toLowerCase() === normalizedSearch
+    );
+    
+    // If not found, try name mappings
+    if (!matchingName && nameMappings[normalizedSearch]) {
+      const candidates = nameMappings[normalizedSearch];
+      for (const candidate of candidates) {
+        const found = displayNames.find(name => name === candidate);
+        if (found) {
+          matchingName = found;
+          break;
+        }
+      }
+    }
+    
+    // If still not found, try fuzzy matching (contains search term)
+    if (!matchingName) {
+      matchingName = displayNames.find(name => 
+        name.toLowerCase().includes(normalizedSearch) || 
+        normalizedSearch.includes(name.toLowerCase().split(' ')[0]) // Match first word
+      );
+    }
+    
+    // If still not found, try partial word matching
+    if (!matchingName) {
+      const searchWords = normalizedSearch.split(/\s+/);
+      matchingName = displayNames.find(name => {
+        const nameLower = name.toLowerCase();
+        return searchWords.some(word => nameLower.includes(word));
+      });
+    }
+    
+    if (!matchingName) {
+      log(`Audio filter not found: ${filterDisplayName}`, "red");
+      log(`Available filters: ${displayNames.join(', ')}`, "yellow");
+      log(`💡 Tip: Try using the exact filter name, or a common name like "reverb", "eq", "delay"`, "yellow");
+      return false;
+    }
+    
+    log(`Matched "${filterDisplayName}" to "${matchingName}"`, "blue");
+
+    // Create audio filter component
+    const audioFilterComponent = await ppro.AudioFilterFactory.createComponentByDisplayName(
+      matchingName,
+      audioClip
+    );
+
+    // Get audio component chain and append the filter
+    const audioComponentChain = await audioClip.getComponentChain();
+    const action = await audioComponentChain.createAppendComponentAction(audioFilterComponent);
+    await executeAction(project, action);
+
+    log(`✅ Audio filter applied: ${matchingName}`, "green");
+    return true;
+  } catch (err) {
+    log(`Error applying audio filter: ${err}`, "red");
+    console.error("applyAudioFilter error details:", err);
+    return false;
+  }
+}
+
+/**
+ * Adjust volume of an audio clip
+ * @param {AudioClipTrackItem} audioClip - The audio clip to adjust
+ * @param {number} volumeDb - Volume adjustment in decibels (positive = louder, negative = quieter)
+ * @returns {Promise<boolean>}
+ */
+export async function adjustVolume(audioClip, volumeDb = 0) {
+  try {
+    log(`[VOLUME] ========== STARTING VOLUME ADJUSTMENT ==========`, "blue");
+    log(`[VOLUME] Input volumeDb parameter: ${volumeDb} (type: ${typeof volumeDb})`, "blue");
+    const volumeDbNum = Number(volumeDb) || 0;
+    log(`[VOLUME] Parsed volumeDb: ${volumeDbNum}dB`, "blue");
+    log(`[VOLUME] Adjusting volume by ${volumeDbNum}dB`, "blue");
+    
+    const project = await ppro.Project.getActiveProject();
+    if (!project) {
+      log("No active project", "red");
+      return false;
+    }
+
+    if (!audioClip) {
+      log("No audio clip provided", "red");
+      return false;
+    }
+
+    // Get audio component chain
+    const audioComponentChain = await audioClip.getComponentChain();
+    if (!audioComponentChain) {
+      log("No audio component chain", "red");
+      return false;
+    }
+
+    // Helper to find a Gain/Volume parameter across all components
+    const findGainParam = async () => {
+      const compCount = await audioComponentChain.getComponentCount();
+      for (let ci = 0; ci < compCount; ci++) {
+        try {
+          const comp = await audioComponentChain.getComponentAtIndex(ci);
+          const paramCount = await comp.getParamCount();
+          for (let pi = 0; pi < paramCount; pi++) {
+            try {
+              const param = await comp.getParam(pi);
+              const displayName = ((param && param.displayName) || "").trim().toLowerCase();
+              // Look for gain/volume parameters (common names: "Gain", "Volume", "Level")
+              if (displayName === "gain" || displayName === "volume" || displayName === "level") {
+                return param;
+              }
+            } catch (err) {
+              // Continue searching
+            }
+          }
+        } catch (err) {
+          // Continue searching
+        }
+      }
+      return null;
+    };
+
+    // Try to find existing Gain/Volume parameter
+    let gainParam = await findGainParam();
+
+    // If not found, try to add a "Gain" or "Volume" audio filter
+    if (!gainParam) {
+      try {
+        // Get available audio filter display names
+        const displayNames = await ppro.AudioFilterFactory.getDisplayNames();
+        log(`Available audio filters: ${displayNames.join(', ')}`, "blue");
+        
+        // Try common names for gain/volume filters (case-insensitive match)
+        // Note: "Volume" might not be a filter - try "Channel Volume" or "Gain" instead
+        const gainFilterNames = ["Channel Volume", "Gain", "Hard Limiter", "Dynamics", "Volume"];
+        let gainFilterName = null;
+        
+        for (const name of gainFilterNames) {
+          const matching = displayNames.find(dn => dn.toLowerCase() === name.toLowerCase());
+          if (matching) {
+            gainFilterName = matching;
+            break;
+          }
+        }
+        
+        if (!gainFilterName) {
+          log(`Could not find Gain/Volume filter. Available filters: ${displayNames.join(', ')}`, "yellow");
+          log("💡 Tip: Audio clips may have built-in volume. Try selecting clips that already have volume/gain effects applied.", "yellow");
+          return false;
+        }
+
+        // Create and add the gain filter
+        log(`Adding audio filter: ${gainFilterName}`, "blue");
+        try {
+          const gainFilter = await ppro.AudioFilterFactory.createComponentByDisplayName(
+            gainFilterName,
+            audioClip
+          );
+          const appendAction = await audioComponentChain.createAppendComponentAction(gainFilter);
+          await executeAction(project, appendAction);
+        } catch (err) {
+          log(`Could not add ${gainFilterName} filter: ${err.message || err}`, "yellow");
+          log("💡 Tip: Some audio filters may not be compatible. Try applying 'Channel Volume' manually first.", "yellow");
+          return false;
+        }
+        
+        // Search again for the gain parameter
+        gainParam = await findGainParam();
+      } catch (err) {
+        log(`Could not add Gain/Volume filter: ${err}`, "yellow");
+        console.error("Error adding gain filter:", err);
+      }
+    }
+
+    if (!gainParam) {
+      log("Could not find or create gain/volume parameter", "red");
+      log("💡 Tip: This clip may not have a volume parameter. Try applying 'Channel Volume' or 'Gain' audio filter manually first, or select a different audio clip.", "yellow");
+      return false;
+    }
+
+    // Helper function to extract numeric value from objects (efficient extraction)
+    // Used for extracting volume values from getValueAtTime() or Keyframe.value objects
+    function extractNumericValue(obj, source) {
+      if (obj === null || obj === undefined) return null;
+      
+      // Direct number check
+      if (typeof obj === 'number' && !isNaN(obj)) {
+        return obj;
+      }
+      
+      // Check .value property (most common)
+      if ('value' in obj) {
+        const val = obj.value;
+        if (typeof val === 'number' && !isNaN(val)) {
+          log(`[VOLUME] Found number in ${source}.value = ${val}dB`, "blue");
+          return val;
+        }
+        // Check nested .value.value
+        if (typeof val === 'object' && val !== null && 'value' in val) {
+          const nestedVal = val.value;
+          if (typeof nestedVal === 'number' && !isNaN(nestedVal)) {
+            log(`[VOLUME] Found number in ${source}.value.value = ${nestedVal}dB`, "blue");
+            return nestedVal;
+          }
+        }
+      }
+      
+      // Check all properties for a number (fallback)
+      for (const key in obj) {
+        const prop = obj[key];
+        if (typeof prop === 'number' && !isNaN(prop)) {
+          log(`[VOLUME] Found number in ${source}.${key} = ${prop}dB`, "blue");
+          return prop;
+        }
+      }
+      
+      return null;
+    }
+    
+    // Get current volume value - following Premiere Pro UXP API documentation
+    // API Reference: ComponentParam.getValueAtTime(time) → Promise<number | string | boolean | PointF | Color>
+    //                For numeric parameters (like volume/gain), should return number directly
+    // API Reference: ComponentParam.getStartValue() → Promise<Keyframe>
+    //                Keyframe.value is an object that contains the actual value
+    let currentValue = 0;
+    
+    try {
+      const clipInPoint = await audioClip.getInPoint();
+      log(`[VOLUME] Step 1: Clip in point = ${clipInPoint.seconds}s`, "blue");
+      
+      // Method 1: Try getValueAtTime() - preferred method per API docs
+      let valueExtracted = false;
+      try {
+        log(`[VOLUME] Step 2: Calling getValueAtTime(${clipInPoint.seconds}s)...`, "blue");
+        const valueAtTime = await gainParam.getValueAtTime(clipInPoint);
+        log(`[VOLUME] Step 3: getValueAtTime() returned:`, valueAtTime, "blue");
+        log(`[VOLUME] Step 4: Return type = ${typeof valueAtTime}`, "blue");
+        
+        // Extract numeric value efficiently
+        if (typeof valueAtTime === 'number' && !isNaN(valueAtTime)) {
+          currentValue = valueAtTime;
+          valueExtracted = true;
+          log(`[VOLUME] ✅ SUCCESS: Direct number extraction = ${currentValue}dB`, "green");
+        } else if (typeof valueAtTime === 'object' && valueAtTime !== null) {
+          log(`[VOLUME] Step 5: Object detected, inspecting structure...`, "blue");
+          log(`[VOLUME] Step 6: Object keys = [${Object.keys(valueAtTime).join(', ')}]`, "blue");
+          log(`[VOLUME] Step 7: Object JSON = ${JSON.stringify(valueAtTime)}`, "blue");
+          
+          // Try common extraction paths: .value, .value.value
+          const extracted = extractNumericValue(valueAtTime, "getValueAtTime()");
+          if (extracted !== null) {
+            currentValue = extracted;
+            valueExtracted = true;
+            log(`[VOLUME] ✅ SUCCESS: Extracted from object = ${currentValue}dB`, "green");
+          }
+        }
+        
+        if (!valueExtracted) {
+          log(`[VOLUME] ⚠️ WARNING: Could not extract number from getValueAtTime(), trying fallback...`, "yellow");
+          throw new Error("getValueAtTime did not return extractable number");
+        }
+      } catch (e) {
+        log(`[VOLUME] Step 8: getValueAtTime() failed: ${e.message}`, "yellow");
+        
+        // Method 2: Fallback to getStartValue() - returns Keyframe object
+        try {
+          log(`[VOLUME] Step 9: Calling getStartValue() as fallback...`, "blue");
+          const keyframe = await gainParam.getStartValue();
+          log(`[VOLUME] Step 10: getStartValue() returned Keyframe:`, keyframe, "blue");
+          log(`[VOLUME] Step 11: Keyframe type = ${typeof keyframe}`, "blue");
+          log(`[VOLUME] Step 12: Keyframe keys = [${Object.keys(keyframe || {}).join(', ')}]`, "blue");
+          
+          if (keyframe && 'value' in keyframe) {
+            const keyframeValue = keyframe.value;
+            log(`[VOLUME] Step 13: Keyframe.value =`, keyframeValue, "blue");
+            log(`[VOLUME] Step 14: Keyframe.value type = ${typeof keyframeValue}`, "blue");
+            
+            if (typeof keyframeValue === 'number' && !isNaN(keyframeValue)) {
+              currentValue = keyframeValue;
+              valueExtracted = true;
+              log(`[VOLUME] ✅ SUCCESS: Direct Keyframe.value = ${currentValue}dB`, "green");
+            } else if (typeof keyframeValue === 'object' && keyframeValue !== null) {
+              log(`[VOLUME] Step 15: Keyframe.value is object, keys = [${Object.keys(keyframeValue).join(', ')}]`, "blue");
+              log(`[VOLUME] Step 16: Keyframe.value JSON = ${JSON.stringify(keyframeValue)}`, "blue");
+              
+              const extracted = extractNumericValue(keyframeValue, "Keyframe.value");
+              if (extracted !== null) {
+                currentValue = extracted;
+                valueExtracted = true;
+                log(`[VOLUME] ✅ SUCCESS: Extracted from Keyframe.value = ${currentValue}dB`, "green");
+              }
+            }
+          }
+          
+          if (!valueExtracted) {
+            log(`[VOLUME] ⚠️ WARNING: Could not extract number from getStartValue()`, "yellow");
+          }
+        } catch (e2) {
+          log(`[VOLUME] ❌ ERROR: getStartValue() failed: ${e2.message}`, "red");
+          console.error("[VOLUME] getStartValue() error details:", e2);
+        }
+      }
+      
+      // Final validation and logging
+      if (!valueExtracted || typeof currentValue !== 'number' || isNaN(currentValue)) {
+        log(`[VOLUME] ⚠️ WARNING: Could not extract valid volume, defaulting to 0dB`, "yellow");
+        log(`[VOLUME] ⚠️ WARNING: valueExtracted=${valueExtracted}, currentValue=${currentValue}, type=${typeof currentValue}`, "yellow");
+        currentValue = 0;
+      }
+      
+      log(`[VOLUME] ✅ FINAL: Current volume (linear) = ${currentValue}`, "blue");
+      
+    } catch (err) {
+      log(`[VOLUME] ❌ EXCEPTION: ${err.message}`, "red");
+      console.error("[VOLUME] Exception details:", err);
+      console.error("[VOLUME] Exception stack:", err.stack);
+      currentValue = 1.0; // Default to unity gain (1.0 = 0dB linear multiplier)
+    }
+
+    // CRITICAL: Premiere Pro's gain/volume parameters use LINEAR MULTIPLIERS, not dB!
+    // Conversion formulas:
+    //   linear = 10^(dB/20)   (dB to linear)
+    //   dB = 20 * log10(linear)   (linear to dB)
+    // Examples:
+    //   1.0 = 0dB (unity gain)
+    //   2.0 = +6dB (double amplitude)
+    //   0.5 = -6dB (half amplitude)
+    //   0.224 ≈ -13dB
+    
+    log(`[VOLUME] Step 17: Converting between linear and dB scales...`, "blue");
+    log(`[VOLUME] Step 18: Current value (linear) = ${currentValue}`, "blue");
+    
+    // Convert current linear value to dB
+    const currentValueDb = 20 * Math.log10(Math.max(currentValue, 0.0001)); // Avoid log(0)
+    log(`[VOLUME] Step 19: Current value in dB = ${currentValueDb.toFixed(2)}dB`, "blue");
+    
+    // User wants to adjust by this many dB
+    const adjustmentDb = volumeDbNum;
+    log(`[VOLUME] Step 20: Adjustment amount = ${adjustmentDb}dB`, "blue");
+    
+    // Calculate new dB value (relative adjustment)
+    const newValueDb = currentValueDb + adjustmentDb;
+    log(`[VOLUME] Step 21: New value in dB = ${newValueDb.toFixed(2)}dB (${currentValueDb.toFixed(2)}dB + ${adjustmentDb}dB)`, "blue");
+    
+    // Convert back to linear multiplier for Premiere Pro
+    const finalValue = Math.pow(10, newValueDb / 20);
+    log(`[VOLUME] Step 22: Converting back to linear: 10^(${newValueDb.toFixed(2)}/20) = ${finalValue.toFixed(6)}`, "blue");
+    log(`[VOLUME] Step 23: Setting volume to linear value ${finalValue.toFixed(6)} (equivalent to ${newValueDb.toFixed(2)}dB)`, "blue");
+    
+    log(`[VOLUME] Step 24: Final values - Current: ${currentValue} (linear) = ${currentValueDb.toFixed(2)}dB, Adjustment: ${adjustmentDb}dB, New: ${finalValue.toFixed(6)} (linear) = ${newValueDb.toFixed(2)}dB`, "blue");
+
+    // Set value using Premiere Pro UXP API pattern
+    // API Reference: ComponentParam.createKeyframe(value) → Keyframe
+    //                ComponentParam.createSetValueAction(keyframe, isTimeVarying) → Action
+    log(`[VOLUME] Step 25: Setting volume using UXP API...`, "blue");
+    log(`[VOLUME] Step 26: About to set linear value = ${finalValue.toFixed(6)} (type: ${typeof finalValue})`, "blue");
+    
+    try {
+      log(`[VOLUME] Step 27: Creating keyframe with linear value ${finalValue.toFixed(6)}...`, "blue");
+      const keyframe = await gainParam.createKeyframe(Number(finalValue));
+      log(`[VOLUME] Step 28: Keyframe created successfully`, "blue");
+      log(`[VOLUME] Step 29: Keyframe object:`, keyframe, "blue");
+      log(`[VOLUME] Step 30: Keyframe.value:`, keyframe && keyframe.value, "blue");
+      
+      log(`[VOLUME] Step 31: Creating setValueAction (isTimeVarying=true)...`, "blue");
+      const setAction = await gainParam.createSetValueAction(keyframe, true);
+      log(`[VOLUME] Step 32: Action created successfully`, "blue");
+      
+      log(`[VOLUME] Step 33: Executing action...`, "blue");
+      await executeAction(project, setAction);
+      log(`[VOLUME] Step 34: Action executed successfully`, "blue");
+      
+      // Verify what value was actually set by reading it back
+      log(`[VOLUME] Step 35: Verifying set value by reading it back...`, "blue");
+      try {
+        const clipInPointForVerify = await audioClip.getInPoint();
+        const verifyValue = await gainParam.getValueAtTime(clipInPointForVerify);
+        log(`[VOLUME] Step 36: Read back value:`, verifyValue, "blue");
+        const extractedVerify = extractNumericValue(verifyValue, "verify");
+        if (extractedVerify !== null) {
+          const verifyDb = 20 * Math.log10(Math.max(extractedVerify, 0.0001));
+          log(`[VOLUME] Step 37: Extracted verify value: ${extractedVerify} (linear) = ${verifyDb.toFixed(2)}dB`, "blue");
+          if (Math.abs(extractedVerify - finalValue) > 0.01) {
+            log(`[VOLUME] ⚠️ WARNING: Set ${finalValue.toFixed(6)} (${newValueDb.toFixed(2)}dB) but read back ${extractedVerify} (${verifyDb.toFixed(2)}dB) - Premiere Pro may have changed it!`, "yellow");
+          }
+        }
+      } catch (verifyErr) {
+        log(`[VOLUME] ⚠️ Could not verify set value: ${verifyErr.message}`, "yellow");
+      }
+      
+      log(`[VOLUME] ✅ SUCCESS: Volume adjusted ${currentValueDb.toFixed(2)}dB → ${newValueDb.toFixed(2)}dB (${adjustmentDb > 0 ? '+' : ''}${adjustmentDb}dB)`, "green");
+      return true;
+    } catch (err) {
+      log(`[VOLUME] ⚠️ WARNING: Keyframe method failed: ${err.message}`, "yellow");
+      console.error("[VOLUME] Keyframe method error:", err);
+      console.error("[VOLUME] Error stack:", err.stack);
+      
+      // Fallback: Try direct setValue (some audio params might not support keyframes)
+      try {
+        log(`[VOLUME] Step 38: Trying fallback method (direct setValue, isTimeVarying=false)...`, "yellow");
+        log(`[VOLUME] Step 39: About to set linear value = ${finalValue.toFixed(6)} directly...`, "blue");
+        const setValueAction = await gainParam.createSetValueAction(Number(finalValue), false);
+        log(`[VOLUME] Step 40: Fallback action created`, "blue");
+        
+        await executeAction(project, setValueAction);
+        log(`[VOLUME] ✅ SUCCESS (fallback): Volume adjusted ${currentValueDb.toFixed(2)}dB → ${newValueDb.toFixed(2)}dB`, "green");
+        return true;
+      } catch (err2) {
+        log(`[VOLUME] ❌ ERROR: Both methods failed. Last error: ${err2.message || err2}`, "red");
+        console.error("[VOLUME] Fallback method error:", err2);
+        console.error("[VOLUME] Error stack:", err2.stack);
+        return false;
+      }
+    }
+  } catch (err) {
+    log(`Error adjusting volume: ${err}`, "red");
+    console.error("adjustVolume error details:", err);
+    return false;
+  }
+}
+
+// ============ DEMO/TEST FUNCTIONS ============
+
+/**
+ * Simple test - zoom in on first selected clip
+ */
+export async function testZoom() {
+  log("🧪 Testing zoom functionality...", "blue");
+  
+  const project = await ppro.Project.getActiveProject();
+  if (!project) {
+    log("No active project", "red");
+    return;
+  }
+
+  const sequence = await project.getActiveSequence();
+  if (!sequence) {
+    log("No sequence found", "red");
+    return;
+  }
+
+  const selection = await sequence.getSelection();
+  if (!selection) {
+    log("No selection found", "red");
+    return;
+  }
+
+  const trackItems = await selection.getTrackItems();
+  if (!trackItems || trackItems.length === 0) {
+    log("❌ No clips selected. Please select a clip on the timeline.", "red");
+    return;
+  }
+
+  log(`Found ${trackItems.length} selected clip(s)`, "blue");
+
+  // Test zoom in on all selected clips
+  const result = await zoomInBatch(trackItems, {
+    startScale: 100,
+    endScale: 150,
+    interpolation: 'BEZIER'
+  });
+
+  log(`🎉 Test complete! ${result.successful} clips zoomed successfully.`, "green");
+}
+
+// ============ PARAMETER MODIFICATION ============
+
+/**
+ * Get all modifiable parameters from a clip's effects
+ * @param {TrackItem} trackItem - The clip to inspect
+ * @returns {Promise<Array>} Array of parameter info objects
+ */
+export async function getEffectParameters(trackItem) {
+  try {
+    if (!trackItem) {
+      log("No track item provided", "red");
+      return [];
+    }
+
+    const componentChain = await trackItem.getComponentChain();
+    if (!componentChain) {
+      log("No component chain", "red");
+      return [];
+    }
+
+    const parameters = [];
+    const compCount = componentChain.getComponentCount();
+    
+    for (let ci = 0; ci < compCount; ci++) {
+      const comp = await componentChain.getComponentAtIndex(ci);
+      const matchName = await comp.getMatchName();
+      const displayName = await comp.getDisplayName();
+      
+      // Skip built-in components (Opacity, Motion) unless user explicitly wants them
+      const isBuiltIn = matchName.includes("ADBE Opacity") || matchName.includes("ADBE Motion");
+      
+      const paramCount = comp.getParamCount();
+      for (let pi = 0; pi < paramCount; pi++) {
+        const param = await comp.getParam(pi);
+        const paramName = (param && param.displayName ? param.displayName : "").trim();
+        
+        // Skip empty params
+        if (!paramName) continue;
+        
+        parameters.push({
+          componentIndex: ci,
+          paramIndex: pi,
+          componentMatchName: matchName,
+          componentDisplayName: displayName,
+          paramDisplayName: paramName,
+          param: param,
+          isBuiltIn: isBuiltIn
+        });
+      }
+    }
+    
+    log(`Found ${parameters.length} parameters across ${compCount} components`, "blue");
+    return parameters;
+  } catch (err) {
+    log(`Error getting effect parameters: ${err}`, "red");
+    return [];
+  }
+}
+
+/**
+ * Modify a specific effect parameter on a clip
+ * @param {TrackItem} trackItem - The clip to modify
+ * @param {Object} options - Modification options
+ * @param {string} options.parameterName - Name of the parameter to modify (case-insensitive, fuzzy matched)
+ * @param {number} options.value - New value for the parameter
+ * @param {string} options.componentName - (Optional) Name of the component/effect containing the parameter
+ * @param {boolean} options.excludeBuiltIn - Whether to exclude built-in effects like Motion/Opacity (default: true)
+ * @returns {Promise<boolean>}
+ */
+export async function modifyEffectParameter(trackItem, options = {}) {
+  try {
+    const {
+      parameterName,
+      value,
+      startValue,
+      animated = false,
+      duration = null,
+      startTime = 0,
+      interpolation = 'LINEAR',
+      componentName = null,
+      excludeBuiltIn = true
+    } = options;
+
+    if (!parameterName) {
+      log("Parameter name is required", "red");
+      return false;
+    }
+
+    if (value === undefined || value === null) {
+      log("Parameter value is required", "red");
+      return false;
+    }
+
+    log(`Looking for parameter "${parameterName}" to set to ${value}${animated ? ' (animated)' : ''}`, "blue");
+
+    // Get all parameters
+    const allParams = await getEffectParameters(trackItem);
+    
+    if (allParams.length === 0) {
+      log("No parameters found on this clip", "red");
+      return false;
+    }
+
+    // Filter parameters
+    let candidates = allParams;
+    
+    // Exclude built-in if requested
+    if (excludeBuiltIn) {
+      candidates = candidates.filter(p => !p.isBuiltIn);
+      log(`Filtered to ${candidates.length} non-built-in parameters`, "blue");
+    }
+    
+    // Filter by component name if specified
+    if (componentName) {
+      const componentLower = componentName.toLowerCase();
+      candidates = candidates.filter(p => 
+        p.componentDisplayName.toLowerCase().includes(componentLower) ||
+        p.componentMatchName.toLowerCase().includes(componentLower)
+      );
+      log(`Filtered to ${candidates.length} parameters in component "${componentName}"`, "blue");
+    }
+    
+    // Find matching parameter (fuzzy match)
+    const paramLower = parameterName.toLowerCase();
+    const match = candidates.find(p => 
+      p.paramDisplayName.toLowerCase() === paramLower ||
+      p.paramDisplayName.toLowerCase().includes(paramLower) ||
+      paramLower.includes(p.paramDisplayName.toLowerCase())
+    );
+
+    if (!match) {
+      log(`❌ Parameter "${parameterName}" not found`, "red");
+      log(`Available parameters: ${candidates.map(p => p.paramDisplayName).join(', ')}`, "yellow");
+      return false;
+    }
+
+    log(`✓ Found parameter: "${match.paramDisplayName}" in ${match.componentDisplayName}`, "green");
+
+    // Get project for executing action
+    const project = await ppro.Project.getActiveProject();
+    if (!project) {
+      log("No active project", "red");
+      return false;
+    }
+
+    const param = match.param;
+
+    if (animated) {
+      // Animation logic (Keyframes)
+      const clipDuration = await getClipDuration(trackItem);
+      const clipStartTime = await getClipInPoint(trackItem);
+      
+      if (clipDuration === null || clipStartTime === null) {
+        log(`❌ Could not get clip timing information for animation`, "red");
+        return false;
+      }
+      
+      const animDuration = duration !== null ? Number(duration) : clipDuration;
+      const absoluteStartTime = clipStartTime + Number(startTime);
+      const absoluteEndTime = absoluteStartTime + animDuration;
+      
+      // Determine start value
+      let actualStartValue = startValue;
+      if (actualStartValue === undefined || actualStartValue === null) {
+        // If startValue is not provided, try to determine it dynamically
+        try {
+          // If we have a specific start time, get the value at that time (crucial for chains/loops)
+          if (startTime > 0) {
+             const valAtTime = await param.getValueAtTime(
+               ppro.TickTime.createWithSeconds(absoluteStartTime)
+             );
+             actualStartValue = (valAtTime && typeof valAtTime.getValue === 'function')
+               ? await valAtTime.getValue()
+               : Number(valAtTime);
+             log(`Dynamically determined startValue at ${startTime}s: ${actualStartValue}`, "blue");
+          } else {
+             // Otherwise fallback to current CTI value or static value
+             const curr = await param.getValue();
+             actualStartValue = (curr && typeof curr.getValue === 'function') 
+               ? await curr.getValue() 
+               : Number(curr);
+          }
+        } catch(e) {
+          log(`Could not get current value, defaulting start value to 0`, "yellow");
+          actualStartValue = 0;
+        }
+      }
+      
+      log(`Animating "${match.paramDisplayName}" from ${actualStartValue} to ${value} over ${animDuration}s`, "blue");
+      log(`Keyframes: ${absoluteStartTime.toFixed(2)}s -> ${absoluteEndTime.toFixed(2)}s`, "blue");
+      
+      // Add start keyframe
+      const startSuccess = await addKeyframe(
+        param, 
+        project, 
+        absoluteStartTime, 
+        Number(actualStartValue), 
+        interpolation
+      );
+      
+      if (!startSuccess) {
+        log("❌ Failed to create start keyframe", "red");
+        return false;
+      }
+      
+      // Add end keyframe
+      const endSuccess = await addKeyframe(
+        param, 
+        project, 
+        absoluteEndTime, 
+        Number(value), 
+        interpolation
+      );
+      
+      if (!endSuccess) {
+        log("❌ Failed to create end keyframe", "red");
+        return false;
+      }
+      
+      log(`✅ Parameter "${match.paramDisplayName}" animated successfully`, "green");
+      
+    } else {
+      // Static value logic (existing behavior)
+      const keyframe = param.createKeyframe(Number(value));
+      const setAction = param.createSetValueAction(keyframe, true);
+      await executeAction(project, setAction);
+      log(`✅ Parameter "${match.paramDisplayName}" set to ${value}`, "green");
+    }
+
+    return true;
+
+  } catch (err) {
+    log(`❌ Error modifying parameter: ${err}`, "red");
+    console.error("Parameter modification error details:", err);
+    return false;
+  }
+}
+
+/**
+ * Modify multiple parameters on a clip in batch
+ * @param {TrackItem} trackItem - The clip to modify
+ * @param {Array<Object>} modifications - Array of {parameterName, value, componentName?} objects
+ * @param {boolean} excludeBuiltIn - Whether to exclude built-in effects (default: true)
+ * @returns {Promise<{successful: number, failed: number}>}
+ */
+export async function modifyEffectParametersBatch(trackItem, modifications, excludeBuiltIn = true) {
+  log(`Modifying ${modifications.length} parameter(s) on clip...`, "blue");
+  
+  let successful = 0;
+  let failed = 0;
+
+  for (let i = 0; i < modifications.length; i++) {
+    const mod = modifications[i];
+    log(`Processing modification ${i + 1}/${modifications.length}: ${mod.parameterName} = ${mod.value}`, "blue");
+    
+    const result = await modifyEffectParameter(trackItem, {
+      ...mod,
+      excludeBuiltIn
+    });
+    
+    if (result) {
+      successful++;
+    } else {
+      failed++;
+    }
+  }
+
+  log(`✅ Batch complete: ${successful} successful, ${failed} failed`, "green");
+  return { successful, failed };
+}
